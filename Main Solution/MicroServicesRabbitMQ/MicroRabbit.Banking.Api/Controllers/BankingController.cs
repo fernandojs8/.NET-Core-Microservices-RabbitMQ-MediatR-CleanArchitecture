@@ -1,37 +1,21 @@
-﻿using MicroRabbit.Banking.Application.Interfaces;
+using MicroRabbit.Banking.Application.Interfaces;
 using MicroRabbit.Banking.Application.Models;
-using MicroRabbit.Banking.Domain.Models;
 using Microsoft.AspNetCore.Mvc;
-using Microsoft.Extensions.Logging;
+using System;
 using System.Collections.Generic;
-
-namespace MicroRabbit.Banking.Api.Controllers
+using System.Threading.Tasks;
+namespace MicroRabbit.Banking.Api.Controllers;
+[ApiController, Route("api/[controller]")]
+public class BankingController : ControllerBase
 {
-    [ApiController]
-    [Route("api/[controller]")]
-    public class BankingController : ControllerBase
+    private readonly IAccountService _service;
+    public BankingController(IAccountService service) => _service = service;
+    [HttpGet] public IActionResult Get() => Ok(_service.GetAccounts());
+    [HttpPost] public async Task<IActionResult> Post(AccountTransfer transfer)
     {
-        private readonly IAccountService _service;
-        private readonly ILogger<BankingController> _logger;
-
-        public BankingController(ILogger<BankingController> logger, IAccountService service)
-        {
-            _service = service;
-            _logger = logger;
-        }
-
-        [HttpGet]
-        public ActionResult<IEnumerable<Account>> Get()
-        {
-            return Ok(_service.GetAccounts());
-        }
-
-        [HttpPost]
-        public IActionResult Post([FromBody] AccountTransfer accountTransfer)
-        {
-            var message = _service.Transfer(accountTransfer);
-
-            return Ok(message);
-        }
+        try { return Accepted(new { message = await _service.Transfer(transfer) }); }
+        catch (ArgumentException ex) { return BadRequest(new ProblemDetails { Title = ex.Message }); }
+        catch (KeyNotFoundException ex) { return NotFound(new ProblemDetails { Title = ex.Message }); }
+        catch (InvalidOperationException ex) { return Conflict(new ProblemDetails { Title = ex.Message }); }
     }
 }

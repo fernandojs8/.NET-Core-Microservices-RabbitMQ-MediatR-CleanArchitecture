@@ -1,18 +1,13 @@
-﻿using MicroServicesRabbitMQ.Domain.Core.Events;
-
-namespace MicroRabbit.Banking.Domain.Events
+using System;
+using MicroServicesRabbitMQ.Domain.Core.Events;
+namespace MicroRabbit.Banking.Domain.Events;
+public class TransferCreatedEvent : Event
 {
-    public class TransferCreatedEvent : Event
+    public int From { get; private set; }
+    public int To { get; private set; }
+    public decimal Amount { get; private set; }
+    public TransferCreatedEvent(int from, int to, decimal amount)
     {
-        public int From { get; private set; }
-        public int To { get; private set; }
-        public decimal Amount { get; private set; }
-
-        public TransferCreatedEvent(int from, int to, decimal amount)
-        {
-            From = from;
-            To = to;
-            Amount = amount;
-        }
+        From = from; To = to; Amount = amount;
     }
 }

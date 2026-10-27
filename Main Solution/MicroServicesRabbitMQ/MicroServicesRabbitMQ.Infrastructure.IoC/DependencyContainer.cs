@@ -1,4 +1,4 @@
-﻿using MediatR;
+using MediatR;
 using MicroRabbit.Banking.Application.Interfaces;
 using MicroRabbit.Banking.Application.Services;
 using MicroRabbit.Banking.Data.Context;
@@ -21,15 +21,11 @@ namespace MicroServicesRabbitMQ.Infrastructure.IoC
 {
     public class DependencyContainer
     {
-        public static void RegisterServices(IServiceCollection services)
+        public static void RegisterServices(IServiceCollection services, Microsoft.Extensions.Configuration.IConfiguration configuration)
         {
             // Domain Bus
-            services.AddSingleton<IEventBus, RabbitMQBus>(sp =>
-            {
-                var scopeFactory = sp.GetRequiredService<IServiceScopeFactory>();
-
-                return new RabbitMQBus(sp.GetService<IMediator>(), scopeFactory);
-            });
+            services.Configure<RabbitMqOptions>(configuration.GetSection("RabbitMQ"));
+            services.AddSingleton<IEventBus, RabbitMQBus>();
 
             // Subscriptions
             services.AddTransient<TransferEventHandler>();

@@ -1,28 +1,24 @@
-﻿using MicroRabbit.Transfer.Data.Context;
+using MicroRabbit.Transfer.Data.Context;
 using MicroRabbit.Transfer.Domain.Interfaces;
 using MicroRabbit.Transfer.Domain.Models;
+using Microsoft.EntityFrameworkCore;
 using System.Collections.Generic;
-
-namespace MicroRabbit.Transfer.Data.Repository
+using System.Linq;
+using System.Threading.Tasks;
+namespace MicroRabbit.Transfer.Data.Repository;
+public class TransferRepository(TransferDbContext context) : ITransferRepository
 {
-    public class TransferRepository : ITransferRepository
+    public IEnumerable<TransferLog> GetTransferLogs() => context.TransferLogs.AsNoTracking().ToList();
+    public async Task Add(TransferLog transferLog)
     {
-        private TransferDbContext _context;
-
-        public TransferRepository(TransferDbContext context)
+        // The unique index is the final guard for simultaneous duplicate deliveries.
+        if (await context.TransferLogs.AnyAsync(x => x.EventId == transferLog.EventId)) return;
+        context.TransferLogs.Add(transferLog);
+        try { await context.SaveChangesAsync(); }
+        catch (DbUpdateException)
         {
-            _context = context;
-        }
-
-        public void Add(TransferLog transferLog)
-        {
-            _context.TransferLogs.Add(transferLog);
-            _context.SaveChanges();
-        }
-
-        public IEnumerable<TransferLog> GetTransferLogs()
-        {
-            return _context.TransferLogs;
+            context.ChangeTracker.Clear();
+            if (!await context.TransferLogs.AnyAsync(x => x.EventId == transferLog.EventId)) throw;
         }
     }
 }

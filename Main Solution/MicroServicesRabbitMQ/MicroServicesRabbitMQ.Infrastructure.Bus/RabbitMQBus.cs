@@ -1,142 +1,163 @@
-﻿using MediatR;
+using MediatR;
 using MicroServicesRabbitMQ.Domain.Core.Bus;
 using MicroServicesRabbitMQ.Domain.Core.Commands;
 using MicroServicesRabbitMQ.Domain.Core.Events;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
+using Microsoft.Extensions.Hosting;
 using Newtonsoft.Json;
 using RabbitMQ.Client;
 using RabbitMQ.Client.Events;
 using System;
 using System.Collections.Generic;
-using System.Linq;
 using System.Text;
 using System.Threading.Tasks;
-
-namespace MicroServicesRabbitMQ.Infrastructure.Bus
+namespace MicroServicesRabbitMQ.Infrastructure.Bus;
+public sealed class RabbitMQBus : IEventBus, IDisposable
 {
-    public sealed class RabbitMQBus : IEventBus
+    private readonly IServiceScopeFactory _scopes;
+    private readonly ILogger<RabbitMQBus> _logger;
+    private readonly RabbitMqOptions _options;
+    private readonly IHostApplicationLifetime _lifetime;
+    private readonly object _gate = new();
+    private volatile bool _returned;
+    private bool _disposed;
+    private IConnection _connection;
+    private IModel _publisher;
+    private readonly Dictionary<string, IModel> _consumers = new();
+    public RabbitMQBus(IServiceScopeFactory scopes, IOptions<RabbitMqOptions> options, ILogger<RabbitMQBus> logger, IHostApplicationLifetime lifetime)
     {
-        private readonly IMediator _mediator;
-        private readonly Dictionary<string, List<Type>> _handlers;
-        private readonly List<Type> _eventTypes;
-        private readonly IServiceScopeFactory _serviceScopeFactory;
-
-        public RabbitMQBus(IMediator mediator, IServiceScopeFactory serviceScopeFactory)
+        _lifetime = lifetime; _scopes = scopes; _options = options.Value; _logger = logger;
+        if (_options.MaxRetries < 0 || _options.RetryDelayMilliseconds < 1) throw new ArgumentException("Invalid RabbitMQ retry configuration");
+    }
+    public async Task SendCommand<T>(T command) where T : Command
+    {
+        using var scope = _scopes.CreateScope();
+        await scope.ServiceProvider.GetRequiredService<IMediator>().Send(command);
+    }
+    private void Connect()
+    {
+        if (_connection?.IsOpen == true && _publisher?.IsOpen == true) return;
+        _publisher?.Dispose();
+        // Keep a recovering connection and consumer channels alive until application shutdown.
+        if (_connection?.IsOpen != true)
         {
-            _mediator = mediator;
-            _serviceScopeFactory = serviceScopeFactory;
-            _handlers = new Dictionary<string, List<Type>>();
-            _eventTypes = new List<Type>();
-        }
-
-        public Task SendCommand<T>(T command) where T : Command
-        {
-            return _mediator.Send(command);
-        }
-
-        public void Publish<T>(T @event) where T : Event
-        {
-            var factory = new ConnectionFactory() { HostName = "localhost" };
-            using (var connection = factory.CreateConnection())
+            if (_connection != null) throw new InvalidOperationException("Broker reconnecting; retry publication later");
+            _connection = new ConnectionFactory
             {
-                using (var channel = connection.CreateModel())
+                HostName = _options.HostName, Port = _options.Port, UserName = _options.UserName,
+                Password = _options.Password, VirtualHost = _options.VirtualHost,
+                DispatchConsumersAsync = true, AutomaticRecoveryEnabled = true,
+                NetworkRecoveryInterval = TimeSpan.FromSeconds(5)
+            }.CreateConnection();
+        }
+        _publisher = _connection.CreateModel();
+        _publisher.ConfirmSelect();
+        _publisher.BasicReturn += (_, _) => _returned = true;
+    }
+    public bool IsReady => _connection?.IsOpen == true && _consumers.Count > 0 && System.Linq.Enumerable.All(_consumers.Values, c => c.IsOpen);
+    public static string QueueName<T>() => typeof(T).Name + ".v2";
+    private void Declare(IModel channel, string queue)
+    {
+        channel.QueueDeclare(queue + ".dead", true, false, false, new Dictionary<string, object> { ["x-queue-type"] = "quorum" });
+        channel.QueueDeclare(queue, true, false, false, new Dictionary<string, object>
+        {
+            ["x-queue-type"] = "quorum", ["x-overflow"] = "reject-publish", ["x-dead-letter-strategy"] = "at-least-once",
+            ["x-dead-letter-exchange"] = "", ["x-dead-letter-routing-key"] = queue + ".dead"
+        });
+        channel.QueueDeclare(queue + ".retry", true, false, false, new Dictionary<string, object>
+        {
+            ["x-message-ttl"] = _options.RetryDelayMilliseconds,
+            ["x-queue-type"] = "quorum", ["x-overflow"] = "reject-publish", ["x-dead-letter-strategy"] = "at-least-once",
+            ["x-dead-letter-exchange"] = "", ["x-dead-letter-routing-key"] = queue
+        });
+    }
+    public void Publish<T>(T @event) where T : Event
+    {
+        lock (_gate)
+        {
+            Connect();
+            var queue = QueueName<T>(); Declare(_publisher, queue);
+            var properties = _publisher.CreateBasicProperties();
+            properties.Persistent = true; properties.ContentType = "application/json";
+            properties.MessageId = @event.EventId.ToString();
+            PublishConfirmed(queue, properties, Encoding.UTF8.GetBytes(JsonConvert.SerializeObject(@event)));
+        }
+    }
+    // Queues are declared on the same channel before publishing to the default exchange.
+    private void PublishConfirmed(string queue, IBasicProperties properties, ReadOnlyMemory<byte> body)
+    {
+        _returned = false;
+        _publisher.BasicPublish("", queue, true, properties, body);
+        _publisher.WaitForConfirmsOrDie(TimeSpan.FromSeconds(10));
+        if (_returned) throw new InvalidOperationException("Broker returned an unroutable message");
+    }
+    public void Subscribe<T, TH>() where T : Event where TH : IEventHandler<T>
+    {
+        lock (_gate)
+        {
+            Connect(); var queue = QueueName<T>();
+            if (_consumers.ContainsKey(queue)) throw new InvalidOperationException("Duplicate subscription: " + queue);
+            var channel = _connection.CreateModel(); Declare(channel, queue);
+            channel.BasicQos(0, 1, false);
+            var consumer = new AsyncEventingBasicConsumer(channel);
+            consumer.Received += async (_, delivery) =>
+            {
+                try
                 {
-                    var eventName = @event.GetType().Name;
-
-                    channel.QueueDeclare(eventName, false, false, false, null);
-
-                    var message = JsonConvert.SerializeObject(@event);
-                    var body = Encoding.UTF8.GetBytes(message);
-
-                    channel.BasicPublish("", eventName, false, null, body);
+                    var message = JsonConvert.DeserializeObject<T>(Encoding.UTF8.GetString(delivery.Body.Span))
+                        ?? throw new InvalidOperationException("Empty event");
+                    using var scope = _scopes.CreateScope();
+                    await scope.ServiceProvider.GetRequiredService<TH>().Handle(message);
+                    channel.BasicAck(delivery.DeliveryTag, false);
+                    _logger.LogInformation("Processed {Queue} event {EventId}", queue, message.EventId);
                 }
-            };
-        }
-
-        public void Subscribe<T, TH>()
-            where T : Event
-            where TH : IEventHandler<T>
-        {
-            var eventName = typeof(T).Name;
-            var handlerType = typeof(TH);
-
-            if (!_eventTypes.Contains(typeof(T)))
-            {
-                _eventTypes.Add(typeof(T));
-            }
-
-            if (!_handlers.ContainsKey(eventName))
-            {
-                _handlers.Add(eventName, new List<Type>());
-            }
-
-            if (_handlers[eventName].Any(s => s.GetType() == handlerType))
-            {
-                throw new ArgumentException($"Handler type {handlerType.Name} is already registered for {eventName}");
-            }
-
-            _handlers[eventName].Add(handlerType);
-
-            StartBasicConsume<T>();
-        }
-
-        private void StartBasicConsume<T>() where T : Event
-        {
-            var factory = new ConnectionFactory() { HostName = "localhost", DispatchConsumersAsync = true };
-
-            using (var connection = factory.CreateConnection())
-            {
-                using (var channel = connection.CreateModel())
+                catch (Exception ex)
                 {
-                    var eventName = typeof(T).Name;
-                    channel.QueueDeclare(eventName, false, false, false, null);
-
-                    var consumer = new AsyncEventingBasicConsumer(channel);
-
-                    consumer.Received += Consumer_Received;
-
-                    channel.BasicConsume(eventName, true, consumer);
-                }
-            }
-        }
-
-        private async Task Consumer_Received(object sender, BasicDeliverEventArgs e)
-        {
-            var eventName = e.RoutingKey;
-            var message = Encoding.UTF8.GetString(e.Body.Span);
-
-            try
-            {
-                await ProcessEvent(eventName, message).ConfigureAwait(false);
-            }
-            catch (Exception ex)
-            {
-            }
-        }
-
-        private async Task ProcessEvent(string eventName, string message)
-        {
-            if (_handlers.ContainsKey(eventName))
-            {
-                using (var scope = _serviceScopeFactory.CreateScope())
-                {
-                    var subscriptions = _handlers[eventName];
-
-                    foreach (var subscription in subscriptions)
+                    _logger.LogError(ex, "Failed processing {Queue}; delivery {Tag}", queue, delivery.DeliveryTag);
+                    try
                     {
-                        var handler = scope.ServiceProvider.GetService(subscription);
-
-                        if (handler == null)
-                            continue;
-
-                        var eventType = _eventTypes.FirstOrDefault(t => t.Name == eventName);
-                        var @event = JsonConvert.DeserializeObject(message, eventType);
-                        var concreteType = typeof(IEventHandler<>).MakeGenericType(eventType);
-
-                        await (Task)concreteType.GetMethod("Handle").Invoke(handler, new object[] { @event });
+                        var retries = delivery.BasicProperties.Headers?.TryGetValue("x-retries", out var value) == true ? Convert.ToInt32(value) : 0;
+                        if (retries >= _options.MaxRetries)
+                        {
+                            channel.BasicNack(delivery.DeliveryTag, false, false);
+                        }
+                        else
+                        {
+                            lock (_gate)
+                            {
+                                Connect(); Declare(_publisher, queue);
+                                var properties = _publisher.CreateBasicProperties(); properties.Persistent = true;
+                                properties.ContentType = "application/json";
+                                properties.MessageId = delivery.BasicProperties.MessageId;
+                                properties.Headers = new Dictionary<string, object> { ["x-retries"] = retries + 1 };
+                                PublishConfirmed(queue + ".retry", properties, delivery.Body);
+                            }
+                            channel.BasicAck(delivery.DeliveryTag, false);
+                        }
+                    }
+                    catch (Exception retryError)
+                    {
+                        _logger.LogError(retryError, "Retry publication failed; leaving delivery unacknowledged until reconnect");
+                        // Close so the broker requeues the unacknowledged delivery. The host restart policy recovers.
+                        channel.Close();
+                        _lifetime.StopApplication();
                     }
                 }
-            }
+            };
+            channel.BasicConsume(queue, false, consumer);
+            _consumers.Add(queue, channel);
+        }
+    }
+    public void Dispose()
+    {
+        lock (_gate)
+        {
+            if (_disposed) return;
+            _disposed = true;
+            foreach (var channel in _consumers.Values) channel.Dispose();
+            _publisher?.Dispose(); _connection?.Dispose();
         }
     }
 }

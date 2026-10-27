@@ -28,24 +28,24 @@ namespace MicroRabbit.Banking.Api
                 options.UseSqlServer(Configuration.GetConnectionString("BankingDbConnection"),b => b.MigrationsAssembly("MicroRabbit.Banking.Api"));
             });
 
-            services.AddMvc().SetCompatibilityVersion(Microsoft.AspNetCore.Mvc.CompatibilityVersion.Version_2_2);
-
             services.AddSwaggerGen(c =>
             {
-                c.SwaggerDoc("v1", new Microsoft.OpenApi.Models.OpenApiInfo { Title = "Banking Microservice", Version = "v1" });
+                c.SwaggerDoc("v1", new Microsoft.OpenApi.OpenApiInfo { Title = "Banking Microservice", Version = "v1" });
             });
 
             services.AddMediatR(typeof(Startup));
 
 
             services.AddControllers();
+            services.AddHealthChecks().AddCheck<DatabaseHealthCheck>("database", tags: new[] { "ready" });
 
             RegisterServices(services);
+            services.AddHostedService<MicroRabbit.Banking.Data.Outbox.OutboxPublisher>();
         }
 
         private void RegisterServices(IServiceCollection services)
         {
-            DependencyContainer.RegisterServices(services);
+            DependencyContainer.RegisterServices(services, Configuration);
         }
 
         // This method gets called by the runtime. Use this method to configure the HTTP request pipeline.
@@ -60,7 +60,7 @@ namespace MicroRabbit.Banking.Api
                 app.UseHsts();
             }
 
-            app.UseHttpsRedirection();
+            if (!Configuration.GetValue<bool>("DisableHttpsRedirection")) app.UseHttpsRedirection();
 
             app.UseRouting();
 
@@ -75,6 +75,8 @@ namespace MicroRabbit.Banking.Api
             app.UseEndpoints(endpoints =>
             {
                 endpoints.MapControllers();
+                endpoints.MapHealthChecks("/health/live", new Microsoft.AspNetCore.Diagnostics.HealthChecks.HealthCheckOptions { Predicate = _ => false });
+                endpoints.MapHealthChecks("/health/ready", new Microsoft.AspNetCore.Diagnostics.HealthChecks.HealthCheckOptions { Predicate = check => check.Tags.Contains("ready") });
             });
         }
     }

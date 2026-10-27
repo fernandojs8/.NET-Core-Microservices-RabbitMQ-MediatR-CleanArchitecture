@@ -1,39 +1,18 @@
-﻿using MicroRabbit.Banking.Domain.Events;
-using MicroRabbit.Transfer.Domain.Commands;
+using MicroRabbit.Banking.Domain.Events;
 using MicroRabbit.Transfer.Domain.Interfaces;
 using MicroRabbit.Transfer.Domain.Models;
 using MicroServicesRabbitMQ.Domain.Core.Bus;
 using System.Threading.Tasks;
-
-namespace MicroRabbit.Transfer.Domain.EventHandlers
+namespace MicroRabbit.Transfer.Domain.EventHandlers;
+public class TransferEventHandler(ITransferRepository repository) : IEventHandler<TransferCreatedEvent>
 {
-    public class TransferEventHandler : IEventHandler<TransferCreatedEvent>
+    public Task Handle(TransferCreatedEvent transfer)
     {
-        private readonly IEventBus _eventBus;
-        private readonly ITransferRepository _repository;
-
-        public TransferEventHandler(IEventBus eventBus, ITransferRepository repository)
+        if (transfer.EventId == System.Guid.Empty) throw new System.ArgumentException("EventId is required");
+        MicroRabbit.Banking.Domain.Models.TransferRules.Validate(transfer.From, transfer.To, transfer.Amount);
+        return repository.Add(new TransferLog
         {
-            _eventBus = eventBus;
-            _repository = repository;
-        }
-
-        public Task Handle(TransferCreatedEvent @event)
-        {
-            var createTransferLogCommand = new CreateTransferLogCommand(@event.From, @event.To, @event.Amount);
-
-            var transferLog = new TransferLog()
-            {
-                Amount = @event.Amount,
-                FromAccount = @event.From,
-                ToAccount = @event.To
-            };
-
-            _repository.Add(transferLog);
-
-            _eventBus.SendCommand(createTransferLogCommand);
-
-            return Task.CompletedTask;
-        }
+            EventId = transfer.EventId, FromAccount = transfer.From, ToAccount = transfer.To, Amount = transfer.Amount
+        });
     }
 }

@@ -1,31 +1,17 @@
-﻿using MediatR;
+using MediatR;
 using MicroRabbit.Banking.Domain.Commands;
 using MicroRabbit.Banking.Domain.Events;
-using MicroServicesRabbitMQ.Domain.Core.Bus;
+using MicroRabbit.Banking.Domain.Interfaces;
 using System.Threading;
 using System.Threading.Tasks;
-
-namespace MicroRabbit.Banking.Domain.CommandHandlers
+namespace MicroRabbit.Banking.Domain.CommandHandlers;
+public class TransferCommandHandler : IRequestHandler<CreateTransferCommand, bool>
 {
-    public class TransferCommandHandler : IRequestHandler<CreateTransferCommand, bool>
+    private readonly IAccountRepository _repository;
+    public TransferCommandHandler(IAccountRepository repository) => _repository = repository;
+    public async Task<bool> Handle(CreateTransferCommand request, CancellationToken cancellationToken)
     {
-        private readonly IEventBus _eventBus;
-
-        public TransferCommandHandler(IEventBus eventBus)
-        {
-            _eventBus = eventBus;
-        }
-
-        public Task<bool> Handle(CreateTransferCommand request, CancellationToken cancellationToken)
-        {
-            // publish event to RabbitMQ
-            _eventBus.Publish(
-                new TransferCreatedEvent(
-                    request.From,
-                    request.To,
-                    request.Amount));
-
-            return Task.FromResult(true);
-        }
+        await _repository.TransferAsync(new TransferCreatedEvent(request.From, request.To, request.Amount), cancellationToken);
+        return true;
     }
 }

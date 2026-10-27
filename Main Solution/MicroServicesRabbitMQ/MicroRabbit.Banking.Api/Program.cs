@@ -1,26 +1,24 @@
 using Microsoft.AspNetCore.Hosting;
-using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Hosting;
-using Microsoft.Extensions.Logging;
-using System;
-using System.Collections.Generic;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.EntityFrameworkCore;
+using MicroRabbit.Banking.Data.Context;
 using System.Linq;
 using System.Threading.Tasks;
-
-namespace MicroRabbit.Banking.Api
+namespace MicroRabbit.Banking.Api;
+public class Program
 {
-    public class Program
+    public static async Task Main(string[] args)
     {
-        public static void Main(string[] args)
+        using var host = CreateHostBuilder(args.Where(arg => arg != "--migrate").ToArray()).Build();
+        if (args.Contains("--migrate"))
         {
-            CreateHostBuilder(args).Build().Run();
+            using var scope = host.Services.CreateScope();
+            await scope.ServiceProvider.GetRequiredService<BankingDbContext>().Database.MigrateAsync();
+            return;
         }
-
-        public static IHostBuilder CreateHostBuilder(string[] args) =>
-            Host.CreateDefaultBuilder(args)
-                .ConfigureWebHostDefaults(webBuilder =>
-                {
-                    webBuilder.UseStartup<Startup>();
-                });
+        await host.RunAsync();
     }
+    public static IHostBuilder CreateHostBuilder(string[] args) => Host.CreateDefaultBuilder(args)
+        .ConfigureWebHostDefaults(webBuilder => webBuilder.UseStartup<Startup>());
 }
