@@ -1,7 +1,7 @@
 name: Build and integration tests
 on:
   push:
-    branches: [main, feat/reliable-transfers]
+    branches: [main]
   pull_request:
   workflow_dispatch:
 permissions:
