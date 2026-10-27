@@ -1,4 +1,4 @@
-﻿using MicroRabbit.Presentation.MVC.Models;
+using MicroRabbit.Presentation.MVC.Models;
 using MicroRabbit.Presentation.MVC.Models.DTO;
 using MicroRabbit.Presentation.MVC.Services;
 using Microsoft.AspNetCore.Mvc;
@@ -40,7 +40,7 @@ namespace MicroRabbit.Presentation.MVC.Controllers
         {
             if (!ModelState.IsValid)
             {
-                return View(model);
+                return View("Index", model);
             }
 
             var transferDTO = new TransferDTO()

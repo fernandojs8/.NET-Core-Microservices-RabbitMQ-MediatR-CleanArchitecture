@@ -1,111 +1,164 @@
-# MicroRabbit — microsserviços .NET, RabbitMQ e MediatR
+# MicroRabbit — transferências, outbox e mensageria confiável
 
-Laboratório de backend distribuído em **C# / ASP.NET Core**, com APIs de Banking e Transfer, mensageria RabbitMQ, comandos com MediatR e persistência SQL Server por Entity Framework Core. A solução explora separação de responsabilidades em projetos de domínio, aplicação, dados e infraestrutura.
+Laboratório de backend em **C# / .NET 10**, com duas APIs ASP.NET Core, SQL Server, EF Core e RabbitMQ. O Banking grava transferências entre contas; o serviço Transfer mantém um log independente, atualizado por eventos. A interface MVC permanece disponível como cliente opcional.
 
-O código é uma demonstração educacional em desenvolvimento. O fluxo de transferência possui limitações de consistência e consumo de mensagens documentadas abaixo; não representa um sistema bancário pronto para produção.
+Este é um projeto de portfólio e estudo. O ambiente fornecido usa dados fictícios e serviços locais; não há autenticação, integração bancária real ou implantação cloud comprovada.
 
-## Estrutura e tecnologias
+## Melhorias implementadas
 
-A [solução principal](Main%20Solution/MicroServicesRabbitMQ/MicroServicesRabbitMQ.sln) fica em `Main Solution/MicroServicesRabbitMQ`.
-
-| Projetos | Responsabilidade |
+| Item do roteiro anterior | Implementação |
 | --- | --- |
-| `MicroRabbit.Banking.Api` / `MicroRabbit.Transfer.Api` | Endpoints HTTP, Swagger e configuração de dependências. |
-| `MicroRabbit.Banking.Application` / `MicroRabbit.Transfer.Application` | Serviços de aplicação e contratos. |
-| `MicroRabbit.Banking.Domain` / `MicroRabbit.Transfer.Domain` | Modelos, comandos, eventos, handlers e interfaces de repositório. |
-| `MicroRabbit.Banking.Data` / `MicroRabbit.Transfer.Data` | DbContexts e repositórios EF Core/SQL Server. |
-| `MicroServicesRabbitMQ.Domain.Core` | Abstrações compartilhadas de comandos, eventos e event bus. |
-| `MicroServicesRabbitMQ.Infrastructure.Bus` / `.Infrastructure.IoC` | Adaptador RabbitMQ e registro de dependências. |
-| `MicroRabbit.Presentation.MVC` | Interface MVC que envia a transferência à API Banking via HttpClient. |
-| [Resources/FirstLesson](Resources/FirstLesson) | Exemplos separados de produtor/consumidor RabbitMQ. |
+| Consumidor e operações assíncronas | Conexão/canais mantidos até shutdown, resolução de dependências por escopo, comando aguardado, falhas registradas e encerramento do host se o canal não puder continuar. |
+| Invariantes e concorrência | Contas distintas e existentes, valor positivo com duas casas decimais, saldo suficiente, limite do saldo de destino e bloqueios SQL para débitos concorrentes. |
+| Consistência e entrega | Débito, crédito e outbox na mesma transação; publicação com confirmação; filas quorum duráveis, mensagens persistentes, ack após persistência, retries com atraso e dead-letter. |
+| Atualização e configuração | Projetos principais em .NET 10, EF Core 10.0.14, Swashbuckle 10.3.1, Newtonsoft.Json 13.0.4; configurações externas e Compose com migrations. |
+| Testes e CI | Testes de unidade, testes SQL/RabbitMQ, migrations e teste do fluxo HTTP em containers no [workflow](.github/workflows/ci.yml). |
 
-Os projetos principais declaram `netcoreapp3.1`; as APIs referenciam EF Core 5.0.13, MediatR 10.0.1 e Swashbuckle 6.2.3. As versões registradas são históricas; a documentação não implica atualização de framework ou dependências.
+MediatR 10.0.1 foi preservado para manter o contrato de comandos. RabbitMQ.Client foi atualizado para 6.8.1, mantendo sua API de canais; uma migração para a API assíncrona 7.x é uma evolução separada. Os exemplos históricos de `Resources/FirstLesson` não integram a solução modernizada.
 
-## Arquitetura e fluxo implementado
+## Arquitetura e garantias
 
 ```mermaid
 flowchart TD
-    MVC["Interface MVC"] --> API["Banking API / AccountService"]
-    API --> DB["BankingDB"]
-    API --> CMD["MediatR / TransferCommandHandler"]
-    CMD --> MQ["RabbitMQ / TransferCreatedEvent"]
+    HTTP["POST /api/Banking"] --> TX["Transação SQL: débito, crédito e outbox"]
+    TX --> BANK["BankingDB"]
+    BANK --> PUB["OutboxPublisher"]
+    PUB --> MQ["RabbitMQ: confirmação de publicação"]
     MQ --> HANDLER["TransferEventHandler"]
-    HANDLER --> LOG["TransferDB / TransferLog"]
-    READ["Transfer API"] --> LOG
+    HANDLER --> AUDIT["TransferDB: EventId único"]
+    HANDLER --> ACK["Ack após persistência"]
+    MQ --> RETRY["Retry com TTL e dead-letter"]
 ```
 
-O diagrama descreve as ligações presentes no código; não comprova entrega fim a fim.
+- O valor sai da origem e entra no destino **dentro da mesma BankingDB**. O serviço Transfer é um consumidor de auditoria, não o responsável por creditar outra instituição.
+- A resposta HTTP **202** indica transferência gravada e evento pendente/em processamento; não confirma que o log já chegou ao consumidor.
+- O publicador só marca o evento como publicado após confirmação do broker. Se cair entre publicação e marcação, republica; o índice único de `EventId` impede logs duplicados.
+- O consumidor usa ack manual após salvar. Falhas vão para uma fila de retry com TTL; após `MaxRetries` novas tentativas, seguem para `.dead`. Filas quorum usam dead-letter com estratégia `at-least-once` e overflow `reject-publish`.
+- A semântica é **pelo menos uma vez**, com deduplicação do efeito no log. Não se promete processamento exatamente uma vez ou disponibilidade com um único nó.
 
-1. A interface envia os dados para `POST /api/Banking`.
-2. `AccountService` consulta a conta de origem, verifica saldo, altera o saldo em memória, envia `CreateTransferCommand` e atualiza o repositório.
-3. O handler publica `TransferCreatedEvent` como JSON na fila de mesmo nome.
-4. O handler de Transfer cria um `TransferLog` e chama outro comando, `CreateTransferLogCommand`.
-5. `GET /api/Transfer` consulta os registros persistidos. `GET /api/Banking` consulta as contas.
+### Organização
 
-O retorno de sucesso do POST não comprova consumo ou persistência no serviço Transfer. Não foi encontrada implementação de crédito do saldo na conta de destino nesse fluxo.
+A [solução](Main%20Solution/MicroServicesRabbitMQ/MicroServicesRabbitMQ.sln) contém os projetos:
 
-## Preparação e execução local
+| Grupo | Responsabilidade |
+| --- | --- |
+| `MicroRabbit.Banking.Api` e `MicroRabbit.Transfer.Api` | HTTP, Swagger, health checks, configuração e migrations. |
+| `*.Application` | Serviços e contratos da aplicação. |
+| `*.Domain` | Modelos, regras, comandos, eventos e interfaces. |
+| `*.Data` | EF Core, transações, outbox e deduplicação do log. |
+| `MicroServicesRabbitMQ.Domain.Core` | Contratos do bus, mensagens e identificador de evento. |
+| `MicroServicesRabbitMQ.Infrastructure.Bus` | Publicação confirmada, consumidor, retries e descarte de recursos. |
+| `MicroServicesRabbitMQ.Infrastructure.IoC` | Registro de dependências. |
+| `MicroRabbit.Presentation.MVC` | Cliente web opcional. |
+| `MicroRabbit.Tests` | Testes unitários e integração. |
 
-Pré-requisitos: Git; SDK/runtime compatíveis com .NET Core 3.1 e os pacotes declarados; SQL Server; RabbitMQ acessível em `localhost` com configuração local compatível com os padrões do cliente; ferramenta `dotnet-ef` compatível com EF Core 5.0.13. Um SDK recente sozinho não garante reprodução deste conjunto legado.
+O contrato `TransferCreatedEvent` ainda fica no domínio Banking e é referenciado por Transfer. Extrair contratos versionados para um projeto independente continua sendo uma melhoria possível.
 
-```powershell
+## Subir o ambiente local
+
+Pré-requisitos: Git, Docker Engine/Desktop e Docker Compose v2. As imagens SQL Server exigem host compatível; reserve memória suficiente para SQL Server e o build do SDK. A reprodução foi preparada para Linux x64 e deve ser validada no seu host.
+
+```bash
 git clone https://github.com/fernandojs8/.NET-Core-Microservices-RabbitMQ-MediatR-CleanArchitecture.git
-Set-Location ".NET-Core-Microservices-RabbitMQ-MediatR-CleanArchitecture/Main Solution/MicroServicesRabbitMQ"
-dotnet restore MicroServicesRabbitMQ.sln
-dotnet build MicroServicesRabbitMQ.sln --no-restore
+cd .NET-Core-Microservices-RabbitMQ-MediatR-CleanArchitecture
+cp .env.example .env
+# Escolha senhas locais no .env antes de iniciar.
+docker compose up --build -d
 ```
 
-Os `appsettings.json` das APIs contêm uma instância SQL Server específica da máquina original. Substitua pelas suas conexões, por exemplo via variáveis no PowerShell, sem versionar credenciais:
+O Compose espera SQL/RabbitMQ saudáveis, executa migrations em jobs separados e inicia as APIs. O `.env` é ignorado pelo Git; use um gerenciador de segredos numa futura implantação. As senhas do exemplo são exclusivamente locais. As portas são vinculadas a `127.0.0.1`.
 
-```powershell
-$env:ConnectionStrings__BankingDbConnection = "Server=localhost;Database=BankingDB;Trusted_Connection=True;"
-$env:ConnectionStrings__TransferDbConnection = "Server=localhost;Database=TransferDB;Trusted_Connection=True;"
-dotnet ef database update --project MicroRabbit.Banking.Api --startup-project MicroRabbit.Banking.Api --context BankingDbContext
-dotnet ef database update --project MicroRabbit.Transfer.Api --startup-project MicroRabbit.Transfer.Api --context TransferDbContext
+| Serviço | Endereço local |
+| --- | --- |
+| Banking Swagger | http://localhost:5000/swagger/index.html |
+| Transfer Swagger | http://localhost:5002/swagger/index.html |
+| RabbitMQ Management | http://localhost:15672 — credenciais do `.env`. |
+| Liveness | `/health/live` — processo ativo. |
+| Readiness | `/health/ready` — SQL acessível; no Transfer, também conexão/canal do consumidor abertos. |
+
+Readiness do Banking não exige o broker: a outbox permite aceitar transferências com publicação temporariamente indisponível. Isso exige monitorar o acúmulo de eventos pendentes.
+
+### Dados e demonstração
+
+As migrations não criam contas reais nem seed automático. Num ambiente **descartável**, com Python 3 e curl instalados, execute:
+
+```bash
+bash scripts/smoke.sh
 ```
 
-O exemplo usa autenticação integrada no Windows; adapte-a ao seu ambiente. As migrations ficam nas APIs. Prepare contas fictícias na BankingDB antes de testar transferências; não se presume um seed pronto.
+O script cria duas contas fictícias, envia uma transferência de 25, espera o log e confere os saldos 75/25. Ele adiciona dados de teste à base local; não o use em um ambiente com dados que precisam ser preservados.
 
-Inicie RabbitMQ e abra terminais separados, na pasta da solução, com as variáveis de conexão correspondentes configuradas em cada sessão:
+Para inspecionar e parar:
 
-```powershell
-# Terminal 1
-dotnet run --project MicroRabbit.Transfer.Api
-# Terminal 2
-dotnet run --project MicroRabbit.Banking.Api
-# Terminal 3 — opcional
-dotnet run --project MicroRabbit.Presentation.MVC
+```bash
+docker compose logs -f banking transfer
+docker compose down
 ```
 
-Os perfis de projeto indicam Banking em `https://localhost:5001`, Transfer em `https://localhost:5003` e MVC em `https://localhost:5005`. As APIs expõem `/swagger/index.html`. Configure o certificado HTTPS de desenvolvimento; o cliente MVC usa a URL Banking fixa `https://localhost:5001/api/Banking`. Perfis IIS Express usam outras portas.
+Os volumes preservam dados. Excluir volumes é uma decisão separada; o CI remove apenas os seus próprios volumes descartáveis ao terminar.
 
-## Limitações observadas no código
+## Execução pelo SDK
 
-- **Consumidor:** `StartBasicConsume` cria conexão e canal em blocos `using`; ambos são descartados ao sair do método, comprometendo a continuidade do consumo.
-- **Entrega:** filas não duráveis, mensagens sem configuração de persistência e consumo com confirmação automática. Não há garantia demonstrada de processamento confiável, retries, dead-letter ou idempotência.
-- **Erros:** o callback do consumidor captura exceções sem registrá-las, dificultando diagnóstico.
-- **Consistência:** atualização do saldo e publicação não têm transação distribuída ou outbox. `SendCommand` não é aguardado em partes do fluxo.
-- **Comando de log:** o handler chama `CreateTransferLogCommand`, mas o registro de dependências não apresenta um handler correspondente.
-- **Regras:** é necessário validar existência das contas, valor positivo, crédito no destino e concorrência antes de considerar uma transferência financeira completa.
-- **Configuração:** host RabbitMQ e URL da API MVC estão fixos no código; conexão SQL depende de configuração local.
-- A separação em camadas não comprova independência total: Transfer usa o evento definido em Banking e há infraestrutura compartilhada de DI.
+O [global.json](global.json) seleciona .NET 10, com avanço permitido entre feature bands. SQL Server e RabbitMQ precisam estar acessíveis.
+
+```bash
+dotnet restore "Main Solution/MicroServicesRabbitMQ/MicroServicesRabbitMQ.sln"
+dotnet build "Main Solution/MicroServicesRabbitMQ/MicroServicesRabbitMQ.sln" -c Release
+```
+
+Defina variáveis `ConnectionStrings__BankingDbConnection`, `ConnectionStrings__TransferDbConnection` e as opções `RabbitMQ__HostName`, `RabbitMQ__Port`, `RabbitMQ__UserName`, `RabbitMQ__Password`, `RabbitMQ__VirtualHost`, `RabbitMQ__MaxRetries` e `RabbitMQ__RetryDelayMilliseconds` conforme seu ambiente. Não grave credenciais no código.
+
+Execute uma vez por banco, antes de iniciar as APIs:
+
+```bash
+dotnet run --project "Main Solution/MicroServicesRabbitMQ/MicroRabbit.Banking.Api" -- --migrate
+dotnet run --project "Main Solution/MicroServicesRabbitMQ/MicroRabbit.Transfer.Api" -- --migrate
+```
+
+Depois, rode cada API em um terminal com `dotnet run --project` e o mesmo caminho, sem `--migrate`. Os perfis de desenvolvimento usam HTTPS Banking 5001 e Transfer 5003; confira as URLs do terminal. O Compose usa HTTP interno com `DisableHttpsRedirection=true`.
+
+Para o cliente MVC, defina `BankingApi__BaseUrl` (padrão `https://localhost:5001`) e rode `MicroRabbit.Presentation.MVC`. Configure o certificado de desenvolvimento para o uso local de HTTPS.
+
+### Bancos e filas existentes
+
+- As migrations históricas foram preservadas. A nova migration adiciona a outbox e preenche IDs diferentes nos logs antigos antes de criar o índice único. Faça backup e revise o SQL gerado antes de aplicar em bases com dados importantes.
+- As novas filas usam o sufixo `.v2` para evitar conflito com as filas antigas não duráveis. Mensagens antigas não são migradas automaticamente; inspecione o backlog e planeje uma conversão explícita de contrato/IDs.
+- Não reverta as migrations de forma automática: isso removeria outbox/IDs. Prefira rollback da aplicação compatível com o esquema ou uma correção progressiva testada.
 
 ## Testes e validação
 
-Não foi identificada suíte automatizada na solução. **Restore, build, migrations e execução não foram realizados nesta revisão**, pois o ambiente não possui `dotnet`. Os comandos acima foram derivados dos projetos e devem ser validados em ambiente compatível, após tratar os bloqueios identificados.
+```bash
+dotnet test "Main Solution/MicroServicesRabbitMQ/MicroRabbit.Tests/MicroRabbit.Tests.csproj" -c Release
+```
 
-Roteiro de validação proposto: consultar contas fictícias; enviar uma transferência pelo Swagger; observar publicação da mensagem; verificar processamento e persistência do log; comparar saldos; simular mensagem duplicada e indisponibilidade do broker. As limitações atuais podem impedir o fluxo completo; esse roteiro não é um resultado de teste.
+Sem infraestrutura, os testes de integração aparecem como **skipped**, sem fingir aprovação. Para executá-los, disponibilize SQL Server com permissão de criar/excluir bases de teste e RabbitMQ local:
 
-## Próximos passos
+```bash
+export RUN_INTEGRATION_TESTS=true
+export TEST_SQL='Server=localhost;User Id=sa;Password=YOUR_LOCAL_TEST_PASSWORD;TrustServerCertificate=True'
+dotnet test "Main Solution/MicroServicesRabbitMQ/MicroRabbit.Tests/MicroRabbit.Tests.csproj" -c Release
+```
 
-1. Corrigir o ciclo de vida do consumidor, handlers e operações assíncronas; adicionar logs de falha.
-2. Definir as invariantes da transferência e testar saldo, valores inválidos, conta inexistente e concorrência.
-3. Implementar entrega confiável com ack manual, idempotência, retries e estratégia de consistência validada.
-4. Atualizar framework/pacotes e externalizar configurações; criar ambiente local reproduzível.
-5. Adicionar testes unitários, integração SQL/RabbitMQ e CI com resultados reais.
+A suíte SQL cria bases com nomes únicos e as remove no fim. A suíte RabbitMQ usa guest/guest local e uma fila exclusiva do tipo de teste; `TEST_RABBIT_VHOST` permite usar um vhost de teste. A autenticação do Compose é própria; para esse teste direto, disponibilize um broker de teste com guest local ou ajuste as opções da suíte.
 
-Para demonstrar cloud, adicionar **como trabalho futuro**: infraestrutura como código, pipeline de deploy, health checks, rastreamento correlacionado e uma demonstração com dados fictícios. Publicar recursos realmente utilizados, commit implantado, métricas medidas e procedimento de recuperação; não há evidência de operação cloud/produção apresentada por este laboratório.
+O [CI](.github/workflows/ci.yml) executa build, testes SQL/RabbitMQ e publica os aplicativos como verificação de empacotamento. Outro job constrói os containers e roda o smoke HTTP, incluindo consumo da outbox. Os resultados TRX ficam como artifacts; veja os [runs reais](https://github.com/fernandojs8/.NET-Core-Microservices-RabbitMQ-MediatR-CleanArchitecture/actions), sem presumir sucesso antes de sua conclusão.
+
+**Validação local da implementação:** build Release e testes unitários devem ser consultados no PR desta mudança. SQL Server, RabbitMQ e Docker não estavam disponíveis no ambiente de desenvolvimento desta revisão; a validação completa depende dos jobs de integração do CI.
+
+## Operação e limites restantes
+
+- API sem autenticação/autorização: o Compose é uma demonstração local. Adicione identidade e permissões antes de qualquer exposição pública.
+- Deduplicação é de **eventos**, não de solicitações HTTP. Um novo POST é uma nova transferência; não faça retries cegos de uma requisição cujo resultado ficou desconhecido. Uma chave de idempotência HTTP é uma evolução necessária para clientes de produção.
+- Um publicador de outbox por instância pode republicar um evento simultaneamente com outro publicador. O consumidor tolera duplicatas; a outbox ainda não usa leases/claim de lotes, limpeza/arquivamento ou métricas de atraso.
+- Falhas transitórias de SQL/deadlocks são propagadas; não há retry automático da operação financeira sem idempotência HTTP.
+- SQL Server e RabbitMQ locais possuem um único nó. Volumes, confirmações e quorum queues não substituem backup, replicação e recuperação testada.
+- Logs estruturados correlacionam publicação/processamento por `EventId`. Não há pipeline OpenTelemetry, dashboard ou metas de latência medidos.
+- Reprocessar a DLQ exige investigação e replay controlado, preservando `EventId`; não descarte mensagens para resolver falhas.
+
+### Evolução cloud
+
+Dockerfile, configuração externa e health checks preparam a aplicação para uma implantação futura. Ainda faltam escolher provedor/recursos, identidade, secret store, TLS de ingresso, infraestrutura como código, deploy/rollback, backups e observabilidade. Não foram provisionados recursos pagos nem publicados números de desempenho ou links de produção sem evidência.
 
 ## Licença
 
-[MIT](LICENSE).
+[MIT](LICENSE). Os exemplos históricos foram mantidos como material educacional.

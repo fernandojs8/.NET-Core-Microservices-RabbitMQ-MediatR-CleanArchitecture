@@ -1,12 +1,11 @@
-﻿using MicroRabbit.Banking.Domain.Models;
+using MicroRabbit.Banking.Domain.Models;
+using MicroRabbit.Banking.Domain.Events;
 using System.Collections.Generic;
-
-namespace MicroRabbit.Banking.Domain.Interfaces
+using System.Threading;
+using System.Threading.Tasks;
+namespace MicroRabbit.Banking.Domain.Interfaces;
+public interface IAccountRepository
 {
-    public interface IAccountRepository
-    {
-        IEnumerable<Account> GetAccounts();
-        Account GetById(int fromAccount);
-        void Update(Account account);
-    }
+    IEnumerable<Account> GetAccounts();
+    Task TransferAsync(TransferCreatedEvent transfer, CancellationToken cancellationToken);
 }

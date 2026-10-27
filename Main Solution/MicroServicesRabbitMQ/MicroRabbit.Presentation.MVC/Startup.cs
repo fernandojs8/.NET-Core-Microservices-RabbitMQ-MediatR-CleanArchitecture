@@ -21,9 +21,8 @@ namespace MicroRabbit.Presentation.MVC
         {
             services.AddControllersWithViews();
 
-            services.AddMvc().SetCompatibilityVersion(Microsoft.AspNetCore.Mvc.CompatibilityVersion.Version_2_2);
-
-            services.AddHttpClient<ITransferService, TransferService>();
+            services.AddHttpClient<ITransferService, TransferService>(client =>
+                client.BaseAddress = new System.Uri(Configuration["BankingApi:BaseUrl"] ?? "https://localhost:5001"));
         }
 
         // This method gets called by the runtime. Use this method to configure the HTTP request pipeline.

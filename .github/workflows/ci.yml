@@ -1,0 +1,71 @@
+name: Build and integration tests
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      sql:
+        image: mcr.microsoft.com/mssql/server:2022-latest
+        env:
+          ACCEPT_EULA: Y
+          MSSQL_SA_PASSWORD: Local_test_password_123!
+        ports: [1433:1433]
+        options: >-
+          --health-cmd "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P Local_test_password_123! -C -Q 'SELECT 1' -b -o /dev/null"
+          --health-interval 5s --health-timeout 5s --health-retries 30
+      rabbitmq:
+        image: rabbitmq:4.2-management
+        ports: [5672:5672]
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q ping"
+          --health-interval 5s --health-timeout 5s --health-retries 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Restore
+        run: dotnet restore "Main Solution/MicroServicesRabbitMQ/MicroServicesRabbitMQ.sln"
+      - name: Build
+        run: dotnet build "Main Solution/MicroServicesRabbitMQ/MicroServicesRabbitMQ.sln" -c Release --no-restore
+      - name: Test SQL Server and RabbitMQ
+        env:
+          RUN_INTEGRATION_TESTS: 'true'
+          TEST_SQL: Server=localhost;User Id=sa;Password=Local_test_password_123!;TrustServerCertificate=True
+        run: dotnet test "Main Solution/MicroServicesRabbitMQ/MicroRabbit.Tests/MicroRabbit.Tests.csproj" -c Release --no-build --logger "trx;LogFileName=tests.trx"
+      - name: Publish both APIs and MVC
+        run: |
+          for project in MicroRabbit.Banking.Api MicroRabbit.Transfer.Api MicroRabbit.Presentation.MVC; do
+            dotnet publish "Main Solution/MicroServicesRabbitMQ/$project/$project.csproj" -c Release --no-build -o "artifacts/$project"
+          done
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: '**/TestResults/*.trx'
+          if-no-files-found: warn
+  containers:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Start disposable environment
+        run: |
+          cp .env.example .env
+          docker compose up --build -d
+      - name: Verify transfer and outbox end to end
+        run: bash scripts/smoke.sh
+      - name: Logs
+        if: always()
+        run: docker compose logs --no-color
+      - name: Clean up disposable data
+        if: always()
+        run: docker compose down -v
